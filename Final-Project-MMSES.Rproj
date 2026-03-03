@@ -1,13 +1,238 @@
-Version: 1.0
+rm(list = ls())
+set.seed(123)
 
-RestoreWorkspace: Default
-SaveWorkspace: Default
-AlwaysSaveHistory: Default
+############################################################
+# 0) Robust plot function (avoids ylim NA/Inf crashes)
+############################################################
+plotQuants <- function(inpMatrix, name) {
+  distrMatrix <-
+    apply(inpMatrix, 1, quantile, probs = c(0.05, 0.5, 0.95), na.rm = TRUE)
+  
+  # x values are time steps = number of rows in inpMatrix
+  tt <- seq_len(ncol(distrMatrix))
+  
+  plot(distrMatrix[2, ], type = "l",
+       ylim = c(min(0, min(distrMatrix, na.rm = TRUE)),
+                max(distrMatrix, na.rm = TRUE)),
+       xlab = "Time step", ylab = name)
+  title(main = name)
+  
+  polygon(c(tt, rev(tt)),
+          c(distrMatrix[3, ], rev(distrMatrix[1, ])),
+          col = "grey75", border = FALSE)
+  
+  lines(distrMatrix[2, ])
+  lines(inpMatrix[, 1], col = "red")
+}
+############################################################
+# 1) SCOPE
+############################################################
+numYears <- 50
+numDraws <- 5000   
 
-EnableCodeIndexing: Yes
-UseSpacesForTab: Yes
-NumSpacesForTab: 2
-Encoding: UTF-8
+############################################################
+# 2) MODEL 1 — SWORDFISH (TARGET SPECIES)
+############################################################
 
-RnwWeave: Sweave
-LaTeX: pdfLaTeX
+# Biology
+r_swordfish       <- 0.3
+K_swordfish       <- 10000
+S_Lim             <- 140
+standardDeviation <- 0.094
+
+# Management
+B_Trigger          <- K_swordfish / 2
+LonglineHooks_High <- 1.7 * 10000000
+LonglineHooks_Low  <- 0.8 * LonglineHooks_High
+
+# Catch
+q_swordfish <- 0.0019
+
+# Economics
+swordfishPrice   <- 20 # up to to 25 euro/kg 
+costsOfFishing_C <- 2.4
+
+# Behavior
+entryFromZero   <- 1.7 * 1000
+entryExitParm_C <- 0.0008
+
+
+F_BiomassGrowth <- function(S) {
+  r <- rep(r_swordfish, length(S))
+  r[S < S_Lim] <- (r_swordfish / S_Lim) * S[S < S_Lim]
+  Bnext <- S + r * S * (1 - S / K_swordfish) *
+    rlnorm(length(S), meanlog = 0, sdlog = standardDeviation)
+  Bnext[Bnext < 0] <- 0
+  return(Bnext)
+}
+
+F_MNG_propRule <- function(B) {
+  Q_T <- rep(LonglineHooks_High, length(B))
+  Q_T[B <= B_Trigger] <- LonglineHooks_Low
+  return(list(commercial = Q_T))
+}
+
+F_FLT_entryExit_C <- function(B, E, R, Q_C) {
+  out_effort <- E + entryExitParm_C * R
+  out_effort[E == 0] <- entryFromZero
+  out_effort[out_effort < 0] <- 0
+  out_effort <- pmin(out_effort, Q_C)
+  return(out_effort)
+}
+
+F_totalCatch <- function(B, E_C) {
+  C <- B * (1 - exp(-q_swordfish * E_C))
+  C <- pmin(C, B)
+  C[C < 0] <- 0
+  return(C)
+}
+
+F_Rents_C <- function(C_C, E_C) {
+  R <- swordfishPrice * C_C - costsOfFishing_C * E_C
+  return(R)
+}
+
+############################################################
+# 3) TURTLES (BYCATCH LAYER) — uses Model 1 effort_C
+############################################################
+
+# Turtle biology (conceptual placeholders — adjust later)
+r_turtle       <- 0.04
+K_turtle       <- 500000
+S_Lim_turtle   <- 1
+sd_turtle      <- 0.10
+
+# Bycatch encounter coefficient (gear/overlap lever)
+q_bycatch <- 0.00002
+
+# Mortality pathway
+p_inst <- 0.18
+p_crit <- 0.25
+p_die_given_crit <- 0.25
+rho <- p_inst + p_crit * p_die_given_crit
+
+F_TurtleGrowth <- function(S) {
+  r <- rep(r_turtle, length(S))
+  r[S < S_Lim_turtle] <- (r_turtle / S_Lim_turtle) * S[S < S_Lim_turtle]
+  Bnext <- S + r * S * (1 - S / K_turtle) *
+    rlnorm(length(S), meanlog = 0, sdlog = sd_turtle)
+  Bnext[Bnext < 0] <- 0
+  return(Bnext)
+}
+
+############################################################
+# 4) STORAGE ARRAYS (one integrated model)
+############################################################
+
+# Swordfish
+biomass    <- array(NA, dim = c(numYears, numDraws))
+licenses_C <- array(NA, dim = c(numYears, numDraws))
+effort_C   <- array(NA, dim = c(numYears, numDraws))
+catch_C    <- array(NA, dim = c(numYears, numDraws))
+rents_C    <- array(NA, dim = c(numYears, numDraws))
+escapement <- array(NA, dim = c(numYears, numDraws))
+
+# Turtles
+turtle_biomass   <- array(NA, dim = c(numYears, numDraws))
+turtle_escape    <- array(NA, dim = c(numYears, numDraws))
+turtle_bycatch_C <- array(NA, dim = c(numYears, numDraws))
+turtle_bycatch_M <- array(NA, dim = c(numYears, numDraws))
+
+############################################################
+# 5) RUN THE INTEGRATED MODEL
+############################################################
+runModel <- function(do_plots = TRUE) {
+  
+  initEsc_swo <- 0.6 * K_swordfish
+  escapement[1, ] <- initEsc_swo
+  biomass[1, ]    <- initEsc_swo
+  
+  effort_C[1, ] <- pmin(70, LonglineHooks_High)
+  catch_C[1, ]  <- F_totalCatch(biomass[1, ], effort_C[1, ])
+  rents_C[1, ]  <- F_Rents_C(catch_C[1, ], effort_C[1, ])
+  
+  # --- Initialize turtles ---
+  initEsc_tur <- 0.6 * K_turtle
+  turtle_escape[1, ]  <- initEsc_tur
+  turtle_biomass[1, ] <- initEsc_tur
+  turtle_bycatch_C[1, ] <- 0
+  turtle_bycatch_M[1, ] <- 0
+  
+  for (iYear in 2:numYears) {
+    
+    #### (A) SWORDFISH SYSTEM ####
+    
+    biomass[iYear, ] <- F_BiomassGrowth(escapement[iYear - 1, ])
+    
+    temp <- F_MNG_propRule(biomass[iYear, ])
+    licenses_C[iYear, ] <- temp$commercial
+    
+    effort_C[iYear, ] <- F_FLT_entryExit_C(
+      biomass[iYear, ],
+      effort_C[iYear - 1, ],
+      rents_C[iYear - 1, ],
+      licenses_C[iYear, ]
+    )
+    
+    catch_C[iYear, ] <- F_totalCatch(biomass[iYear, ], effort_C[iYear, ])
+    
+    rents_C[iYear, ] <- F_Rents_C(catch_C[iYear, ], effort_C[iYear, ])
+    
+    escapement[iYear, ] <- biomass[iYear, ] - catch_C[iYear, ]
+    escapement[iYear, ][escapement[iYear, ] < 0] <- 0
+    
+    
+    
+    #### (B) TURTLE BYCATCH LAYER ####
+    # turtles grow from their own escapement
+    turtle_biomass[iYear, ] <- F_TurtleGrowth(turtle_escape[iYear - 1, ])
+    
+    # bycatch events depend on *swordfish effort* and turtle biomass
+    Ct <- q_bycatch * effort_C[iYear, ] * turtle_biomass[iYear, ]
+    turtle_bycatch_C[iYear, ] <- Ct
+    
+    # deaths are fraction rho of bycatch
+    Mt <- rho * Ct
+    turtle_bycatch_M[iYear, ] <- Mt
+    
+    turtle_escape[iYear, ] <- turtle_biomass[iYear, ] - turtle_bycatch_M[iYear, ]
+    turtle_escape[iYear, ][turtle_escape[iYear, ] < 0] <- 0
+  }
+  
+  # --- Plots (separate, like your Model 1) ---
+  if (do_plots) {
+    plotQuants(rents_C[-1, ],  "Figure 1: Rents (commercial)")
+    plotQuants(effort_C[-1, ], "Figure 2: Effort (commercial)")
+    plotQuants(catch_C[-1, ],  "Figure 3: Swordfish catch")
+    plotQuants(biomass[-1, ],  "Figure 4: Swordfish biomass")
+    abline(h = B_Trigger, lty = 2)
+    
+    plotQuants(turtle_biomass[-1, ], "Figure 5: Turtle biomass (Caretta caretta)")
+    plotQuants(turtle_bycatch_C[-1, ], "Figure 6: Turtle bycatch events (Ct)")
+    plotQuants(turtle_bycatch_M[-1, ], "Figure 7: Turtle bycatch deaths (Mt)")
+  }
+  
+  # --- Indicators / outcomes ---
+  meanSwoB <- round(mean(biomass[numYears, ], na.rm = TRUE), 3)
+  percSwoBelow <- round(sum(biomass[-1, ] < B_Trigger, na.rm = TRUE) /
+                          (numDraws * (numYears - 1)), 3) * 100
+  
+  meanTurB <- round(mean(turtle_biomass[numYears, ], na.rm = TRUE), 3)
+  meanTurDeaths <- round(mean(turtle_bycatch_M[numYears, ], na.rm = TRUE), 6)
+  
+  cat("\n=== OUTCOMES ===\n")
+  cat("Swordfish: mean biomass last year =", meanSwoB, "\n")
+  cat("Swordfish: % time below trigger   =", percSwoBelow, "%\n")
+  cat("Turtles:   rho (death fraction)   =", round(rho,3), "\n")
+  cat("Turtles:   mean biomass last year =", meanTurB, "\n")
+  cat("Turtles:   mean deaths last year  =", meanTurDeaths, "\n")
+  
+  invisible(list(
+    biomass=biomass, effort_C=effort_C, catch_C=catch_C, rents_C=rents_C, escapement=escapement,
+    turtle_biomass=turtle_biomass, turtle_bycatch_C=turtle_bycatch_C, turtle_bycatch_M=turtle_bycatch_M
+  ))
+}
+
+out <- runModel()
+
+
